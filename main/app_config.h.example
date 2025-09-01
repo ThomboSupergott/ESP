@@ -1,0 +1,42 @@
+#pragma once
+
+// --------- Wi-Fi ----------
+#define APP_WIFI_SSID       "YOUR WIFI SSID"
+#define APP_WIFI_PASS       "YOUR WIFI SECRET"
+
+
+// --------- Hostname (DHCP Option 12) ----------
+#define APP_HOSTNAME            "meltem-bridge"
+
+// --------- Netz (DHCP vs. statisch) ----------
+#define APP_NET_USE_DHCP        1      // 1 = DHCP, 0 = feste IP
+
+// Feste IP nur relevant wenn APP_NET_USE_DHCP == 0
+#define APP_NET_STATIC_IP_ADDR      192,168,178,230
+#define APP_NET_STATIC_NETMASK      255,255,255,0
+#define APP_NET_STATIC_GATEWAY      192,168,178,1
+#define APP_NET_STATIC_DNS1         192,168,178,1
+#define APP_NET_STATIC_DNS2         8,8,8,8
+
+// --------- RGB-LED Kill-Pin ----------
+// Wenn dieser Pin (mit internem Pullup) auf GND liegt, bleibt die RGB-LED aus.
+#define APP_LED_KILL_ENABLE     1
+#define APP_LED_KILL_PIN        46     // bei Bedarf auf 10/11/12/13 ändern
+
+// --------- Boot/Watchdog ----------
+// So lange warten wir NACH WLAN-Start auf eine IP, bevor USB/TCP beginnen.
+// 0 = nicht warten (nicht empfohlen)
+#define APP_BOOT_IP_WAIT_S      15
+
+// Netz-Watchdog: wenn so viele Sekunden KEINE IP, wird rebootet.
+// 0 = Watchdog aus
+#define APP_NET_WATCHDOG_S      60
+
+// mDNS
+#define APP_MDNS_ENABLE      1
+#define APP_MDNS_INSTANCE    "Meltem RTU Bridge"
+#define APP_MDNS_SVC_TYPE    "_modbus"   // Service-Typ (z. B. _http)
+#define APP_MDNS_SVC_PROTO   "_tcp"      // _tcp oder _udp
+
+// LED-Helligkeit 0..255 (linear, 0=aus, 255=max)
+#define APP_LED_BRIGHTNESS     60
