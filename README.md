@@ -7,7 +7,7 @@ this project is mainly for connecting a **Meltem Gateway** (https://www.meltem.c
 The Meltem gateway exposes a **Modbus RTU** interface via its Micro-USB port. So you can either connect the Meltem gateway directly by USB to your physical HA instance (example: https://community.home-assistant.io/t/meltem-wrg-ii-integration-via-meltem-gateway-and-modbus/) **or** you use this ESP32 bridge (useful if HA runs as a VM, or your HA machine is far away from the Meltem gateway).
 
 I used a **diymore ESP32-S3 DevKitC-1 N16R8** module with **two USB-C connectors** (one for Serial, one for OTG).
-I had to **bridge the OTG and the 5V IN/OUT solder pads** on the ESP32 board.
+I had to **shorten (connect) the OTG and the 5V IN/OUT solder pads** on the ESP32-S3 DevKit board.
 
 So this is the way I got this working:
 
@@ -44,7 +44,7 @@ You can now plug in your **Meltem gateway** (or other Modbus RTU devices) via **
 
 
 
-Now you have: USB-C Power to ESP32 "COM" -> ESP32 OTG to Meltem Bridge, and the ESP32 connected to your WiFi.
+Now you have: USB-C Power to ESP32 "COM" -> ESP32 OTG to Meltem Bridge, and the ESP32 connected to your WiFi.   
 In HomeAssistant, you can now add a new modbus device via configuration.yaml
 
 modbus:   
@@ -62,10 +62,10 @@ and add the sensors as needed (https://community.home-assistant.io/t/meltem-wrg-
   CONFIG FEATURES IN app_config.h  
 
 
-Create main/app_config.h by copying main/app_config_example.h and editing the values you need.
+Create main/app_config.h by copying main/app_config_example.h and editing the values you need.   
 If an option is omitted, a sensible default is used.
 
-Wi-Fi & Networking
+**Wi-Fi & Networking**
 
 #define APP_WIFI_SSID "..."   
 Your Wi-Fi network name (2.4 GHz).
@@ -87,7 +87,7 @@ Static IP block (only used when APP_NET_USE_DHCP == 0)
 #define APP_NET_STATIC_DNS1 192,168,178,1   
 #define APP_NET_STATIC_DNS2 8,8,8,8   
 
-Boot sequence & reliability   
+**Boot sequence & reliability**   
 
 #define APP_BOOT_IP_WAIT_S 15   
 How many seconds to wait for a valid IP after Wi-Fi starts.   
@@ -97,7 +97,7 @@ If no IP is obtained within this window, the device reboots to recover.
 Network watchdog: if the device stays without an IP for this many seconds (after boot), it will reboot.   
 Set to 0 to disable the watchdog (not recommended).
 
-mDNS (optional but handy)   
+**mDNS (optional but handy)**   
 
 #define APP_MDNS_ENABLE 1   
 1 = enable mDNS so the device is reachable as APP_HOSTNAME.local (e.g., meltem-bridge.local).   
@@ -114,7 +114,7 @@ Protocol for the service (keep _tcp). The service is advertised on port 5020.
 
 Tip: If you use a home router that already resolves DHCP hostnames (e.g., many Fritz!Box models), you may reach the device as meltem-bridge.fritz.box. mDNS adds meltem-bridge.local for zero-config name resolution on most systems.
 
-RGB Status LED
+**RGB Status LED**
 
 #define APP_LED_KILL_ENABLE 1   
 Enable/disable the kill pin that can hard-disable the RGB LED. 
@@ -128,8 +128,8 @@ LED brightness 0..255 (linear). 0 = off, 255 = full brightness.
 This scales all status colors and blinks.
 
 Note: The small red power LED found on many dev boards is hard-wired to 3V3 and cannot be turned off in software.   
-
-2) Status RGB LED — meaning of colors
+   
+**Status RGB LED — meaning of colors**
 
 The on-board WS2812 RGB LED gives quick visual feedback:
 
@@ -149,8 +149,8 @@ The bridge keeps running and will process further requests.
 If the LED stays yellow forever and the device isn’t reachable: it likely didn’t obtain an IP.   
 Check SSID/password, power supply, increase APP_BOOT_IP_WAIT_S, or temporarily disable Wi-Fi power-save in code for debugging. The network watchdog (APP_NET_WATCHDOG_S) will auto-reboot    if the device loses IP for too long.
 
-#
-Quick tips
+
+**Quick tips**
 
 Home Assistant should use type: rtuovertcp, host: <hostname or IP>, port: 5020.   
 The bridge accepts RTU frames with or without CRC; if missing, the bridge appends it before sending over USB.
