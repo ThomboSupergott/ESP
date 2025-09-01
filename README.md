@@ -59,7 +59,7 @@ modbus:
 and add the sensors as needed (https://community.home-assistant.io/t/meltem-wrg-ii-integration-via-meltem-gateway-and-modbus/720906 - Great Work and thanky to user "da_anton")
 
 
-  CONFIG FEATURES IN app_config.h  
+**  CONFIG FEATURES IN app_config.h **  
 
 
 Create main/app_config.h by copying main/app_config_example.h and editing the values you need.   
