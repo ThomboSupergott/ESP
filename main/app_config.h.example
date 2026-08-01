@@ -39,4 +39,9 @@
 #define APP_MDNS_SVC_PROTO   "_tcp"      // _tcp oder _udp
 
 // LED-Helligkeit 0..255 (linear, 0=aus, 255=max)
-#define APP_LED_BRIGHTNESS     60
+#define APP_LED_BRIGHTNESS     10
+
+// USB-Device Watchdog in Seconds. 
+// restart the ESP if no USV Device was found in  xxx seconds. Big thanks to ui-miroslav-baudys !
+// 0 = disable
+#define APP_USB_WATCH_DOG_S    10
