@@ -13,6 +13,7 @@ So this is the way I got this working:
 
 1.) Download and install the **Espressif ESP-IDF** – I used this installer:  
     https://dl.espressif.com/dl/idf-installer/esp-idf-tools-setup-online-2.3.5.exe
+    Tested with ESP-IDF v6.0.2
 
 2.) Download all files from this repo and keep the folder structure.
 
@@ -123,7 +124,7 @@ Enable/disable the kill pin that can hard-disable the RGB LED.
 GPIO used as a pull-up input. If this pin is tied to GND, the RGB LED output is muted.   
 Use a non-strapping input pin (GPIO 10/11/12/13 are also good candidates on ESP32-S3).
 
-#define APP_LED_BRIGHTNESS 60   
+#define APP_LED_BRIGHTNESS 10   
 LED brightness 0..255 (linear). 0 = off, 255 = full brightness.   
 This scales all status colors and blinks.
 
@@ -141,6 +142,8 @@ Wi-Fi is up, TCP server is listening on port 5020. No client is currently sendin
 
 Green (short blink) – Request OK   
 A Modbus RTU-over-TCP request has been successfully forwarded to the Meltem device and a valid response was sent back.
+
+Purple (short blink) - USB Device Watchdog will reboot the ESP.  
 
 Red (short blink) – Error   
 Something failed during the last transaction (e.g., timeout, bad CRC in response, USB hiccup).   
