@@ -1,9 +1,10 @@
-// ESP32-S3 RTU-over-TCP Bridge (ESP-IDF 5.5-3, Managed Components)
+// ESP32-S3 RTU-over-TCP Bridge (ESP-IDF 6.0, Managed Components)
 // - USB CDC-ACM Host (Meltem per USB, 19200 8E1) — RX per Callback
 // - TCP-Server (rtuovertcp) für Home Assistant auf Port 5020
 // - WLAN + Hostname, DHCP/Static IP aus app_config.h
 // - mDNS (_modbus._tcp), LED-Kill-Pin, Boot: erst IP, dann USB/TCP
 // - Netz-Watchdog (Reboot falls zu lange ohne IP)
+// - USB-Device-Watchdog (Reboot falls USB-Gerät fehlt)
 // - Akzeptiert TCP-Frames mit/ohne CRC; ergänzt CRC bei Bedarf
 
 #include <string.h>
@@ -62,6 +63,9 @@
 #ifndef APP_NET_WATCHDOG_S
 #  define APP_NET_WATCHDOG_S 60      // Sekunden ohne IP -> Reboot (0=aus)
 #endif
+#ifndef APP_USB_WATCH_DOG_S
+#  define APP_USB_WATCH_DOG_S 10     // Sekunden ohne USB -> Reboot (0=aus)
+#endif
 #ifndef APP_LED_KILL_ENABLE
 #  define APP_LED_KILL_ENABLE 0
 #endif
@@ -113,8 +117,6 @@
 #define MB_TIMEOUT_MS  700
 #define MB_MAX_FRAME   256
 
-#define WIFI_TX_PWR_DBM_QL    34
-
 static const char *TAG = "rtu_tcp_bridge";
 
 // ===== LED =====
@@ -137,14 +139,13 @@ static inline uint8_t apply_brightness(uint8_t v) {
     return (uint8_t)((uint16_t)v * (uint16_t)APP_LED_BRIGHTNESS / 255);
 }
 
-
-
 static inline void led_show(uint8_t r, uint8_t g, uint8_t b) {
     if (led_is_muted()) return;
     led_strip_set_pixel(s_strip, 0,
         apply_brightness(r), apply_brightness(g), apply_brightness(b));
     led_strip_refresh(s_strip);
 }
+
 static void led_blink(uint8_t r, uint8_t g, uint8_t b, int on_ms) {
     if (led_is_muted()) return;
     led_strip_set_pixel(s_strip, 0,
@@ -153,7 +154,9 @@ static void led_blink(uint8_t r, uint8_t g, uint8_t b, int on_ms) {
     vTaskDelay(pdMS_TO_TICKS(on_ms));
     led_strip_clear(s_strip);
     led_strip_refresh(s_strip);
-}static void led_init(void) {
+}
+
+static void led_init(void) {
 #if APP_LED_KILL_ENABLE
     gpio_config_t io = {
         .pin_bit_mask = 1ULL << APP_LED_KILL_PIN,
@@ -167,7 +170,6 @@ static void led_blink(uint8_t r, uint8_t g, uint8_t b, int on_ms) {
     led_strip_config_t strip_config = {
         .strip_gpio_num = LED_STRIP_GPIO,
         .max_leds = LED_STRIP_LEN,
-        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
         .led_model = LED_MODEL_WS2812,
         .flags.invert_out = false,
     };
@@ -189,6 +191,7 @@ static uint16_t mb_crc16(const uint8_t *buf, size_t len) {
     }
     return crc;
 }
+
 static inline bool mb_frame_has_crc(const uint8_t *buf, size_t len) {
     if (len < 4) return false;
     uint16_t crc_in = (uint16_t)buf[len-2] | ((uint16_t)buf[len-1] << 8);
@@ -261,35 +264,10 @@ static void new_dev_cb(usb_device_handle_t usb_dev) {
     }
 }
 
-// USB Host + CDC initialisieren und ggf. öffnen
+// USB Host + CDC öffnen (Treiber-Installation ist jetzt in app_main)
 static esp_err_t cdc_open_if_needed(void) {
     if (s_cdc) return ESP_OK;
-
-    static bool usb_host_ready = false;
-    if (!usb_host_ready) {
-        usb_host_config_t host_cfg = {0};
-        ESP_ERROR_CHECK(usb_host_install(&host_cfg));
-        usb_host_ready = true;
-        ESP_LOGI(TAG, "USB Host installiert");
-        if (!s_usb_evt_task) {
-            xTaskCreatePinnedToCore(usb_host_event_task, "usb_evt", 4096, NULL, 6, &s_usb_evt_task, 0);
-        }
-    }
-
-    static bool cdc_driver_ready = false;
-    if (!cdc_driver_ready) {
-        cdc_acm_host_driver_config_t cfg = {
-            .driver_task_stack_size = 4096,
-            .driver_task_priority   = 5,
-            .xCoreID                = 0,
-            .new_dev_cb             = new_dev_cb,
-        };
-        ESP_ERROR_CHECK(cdc_acm_host_install(&cfg));
-        cdc_driver_ready = true;
-        ESP_LOGI(TAG, "CDC-ACM Host installiert");
-    }
-
-    if (!s_have_vidpid) return ESP_ERR_NOT_FOUND;
+    if (!s_have_vidpid) return ESP_ERR_NOT_FOUND; // Warten, bis Enumeration fertig ist
 
     cdc_acm_host_device_config_t dev_cfg = {
         .connection_timeout_ms = 1000,
@@ -343,9 +321,14 @@ static void on_wifi_event(void* arg, esp_event_base_t base, int32_t id, void* da
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_up = false;
         esp_wifi_disconnect();
+        
+        ESP_LOGW(TAG, "WLAN getrennt, warte 3 Sekunden vor Reconnect...");
+        vTaskDelay(pdMS_TO_TICKS(3000)); // 3 Sekunden Backoff-Zeit
+        
         esp_wifi_connect();   // reconnect
     }
 }
+
 static void on_ip_event(void* arg, esp_event_base_t base, int32_t id, void* data) {
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* e = (ip_event_got_ip_t*)data;
@@ -388,6 +371,8 @@ static void wifi_init_and_connect(void) {
     wifi_config_t wcfg = {0};
     strncpy((char*)wcfg.sta.ssid, APP_WIFI_SSID, sizeof(wcfg.sta.ssid)-1);
     strncpy((char*)wcfg.sta.password, APP_WIFI_PASS, sizeof(wcfg.sta.password)-1);
+    
+    // Wieder auf WPA2, damit der Router es akzeptiert
     wcfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -398,14 +383,15 @@ static void wifi_init_and_connect(void) {
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_connect());
 
-    // esp_wifi_set_ps(WIFI_PS_NONE); // falls Startprobleme mit PS auftreten
-
     ESP_LOGI(TAG, "WiFi connecting to \"%s\" as \"%s\" ...", APP_WIFI_SSID, APP_HOSTNAME);
 }
+
 static void wifi_powersave(void) {
-    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
-    esp_wifi_set_max_tx_power(WIFI_TX_PWR_DBM_QL);
+    // MAX_MODEM ist zu aggressiv, MIN_MODEM hält die Verbindung stabil
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM); 
+    // esp_wifi_set_max_tx_power() entfernt für max power
 }
+
 static void cpu_powersave(void) {
 #if CONFIG_PM_ENABLE
     esp_pm_config_t pmcfg = { .max_freq_mhz = 240, .min_freq_mhz = 80, .light_sleep_enable = false };
@@ -535,6 +521,31 @@ static void net_watchdog_task(void* arg) {
 #endif
 }
 
+// USB-Device Watchdog von PR
+static void usb_device_watchdog_task(void* arg) {
+#if APP_USB_WATCH_DOG_S == 0
+    vTaskDelete(NULL);
+#else
+    TickType_t last_ok = xTaskGetTickCount();
+    for (;;) {
+        if (s_cdc) last_ok = xTaskGetTickCount();
+        
+        if ((xTaskGetTickCount() - last_ok) > pdMS_TO_TICKS((APP_USB_WATCH_DOG_S)*1000)) {
+            ESP_LOGE(TAG, "No USB device for %d s -> reboot", APP_USB_WATCH_DOG_S);
+            
+            // NEU: 3 Sekunden lang schnelles, lila Blinken vor dem Neustart
+            for (int i = 0; i < 10; i++) {
+                led_blink(255, 0, 255, 150);    // 150ms Lila an, dann aus
+                vTaskDelay(pdMS_TO_TICKS(150)); // 150ms Pause (Aus)
+            }
+            
+            esp_restart();
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+#endif
+}
+
 static void tcp_server_task(void *arg) {
     int listenfd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (listenfd < 0) { ESP_LOGE(TAG, "socket()"); vTaskDelete(NULL); return; }
@@ -553,30 +564,45 @@ static void tcp_server_task(void *arg) {
     ESP_LOGI(TAG, "RTU-over-TCP Server lauscht auf *:%d", TCP_LISTEN_PORT);
 
     while (1) {
-        //led_show(255,150,0); // gelb: idle
-        led_show(0,0,180);  // Blau = "warte auf IP"
+        led_show(255, 150, 0);  // Gelb = Idle / Bereit
+        
         struct sockaddr_in cli; socklen_t clen = sizeof(cli);
         int cli_fd = accept(listenfd, (struct sockaddr*)&cli, &clen);
         if (cli_fd < 0) continue;
 
         ESP_LOGI(TAG, "Client %s:%d verbunden", inet_ntoa(cli.sin_addr), ntohs(cli.sin_port));
-        struct timeval tvc; tvc.tv_sec = TCP_CLIENT_TIMEOUT_S; tvc.tv_usec = 0;
-        setsockopt(cli_fd, SOL_SOCKET, SO_RCVTIMEO, &tvc, sizeof(tvc));
+        
+        // Timeout-Timer starten
+        uint32_t last_activity = xTaskGetTickCount(); 
 
         for (;;) {
             if (cdc_open_if_needed() != ESP_OK) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
 
-            struct timeval tvgap; tvgap.tv_sec = 0; tvgap.tv_usec = 20000; // 20 ms
+            // Lücken-Timeout von 20ms wird auf den Socket angewendet
+            struct timeval tvgap; tvgap.tv_sec = 0; tvgap.tv_usec = 20000; 
             setsockopt(cli_fd, SOL_SOCKET, SO_RCVTIMEO, &tvgap, sizeof(tvgap));
 
             uint8_t req[MB_MAX_FRAME];
             ssize_t rlen = recv_rtu_frame_with_gap(cli_fd, req, sizeof(req), TCP_RX_IDLE_GAP_MS, MB_TIMEOUT_MS);
+            
             if (rlen == 0) { ESP_LOGI(TAG, "Client disconnect"); break; }
+            
+            if (rlen == -2) {
+                // Manueller Idle-Timeout Check (120 Sekunden)
+                if ((xTaskGetTickCount() - last_activity) > pdMS_TO_TICKS(TCP_CLIENT_TIMEOUT_S * 1000)) {
+                    ESP_LOGW(TAG, "Client idle timeout (%ds) erreicht, werfe ihn raus", TCP_CLIENT_TIMEOUT_S);
+                    break; 
+                }
+                continue; // Nichts empfangen, aber Timeout noch nicht erreicht -> weiterlauschen
+            }
+            
             if (rlen < 0) {
-                if (rlen == -2) continue;
                 ESP_LOGW(TAG, "recv error (%d), Client schließen", (int)rlen);
                 break;
             }
+
+            // Erfolgreicher Empfang -> Timer zurücksetzen!
+            last_activity = xTaskGetTickCount();
 
             uint8_t resp[MB_MAX_FRAME];
             int resp_len = forward_rtu_over_cdc(req, (size_t)rlen, resp, sizeof(resp), MB_TIMEOUT_MS);
@@ -598,8 +624,25 @@ void app_main(void) {
     s_rx_stream  = xStreamBufferCreate(RX_STREAM_CAPACITY, 1);
     configASSERT(s_rx_stream);
 
-    led_init();
-    led_show(255,150,0); // warten
+	led_init();
+    led_show(0, 0, 255); // Blau = Booten & warten auf Netzwerk
+
+    // NEU: USB-Treiber so früh wie möglich installieren (mit PR Ergänzungen)
+    usb_host_config_t host_cfg = {
+        .skip_phy_setup = false,
+        .intr_flags = ESP_INTR_FLAG_LEVEL1,
+    };
+    ESP_ERROR_CHECK(usb_host_install(&host_cfg));
+    xTaskCreatePinnedToCore(usb_host_event_task, "usb_evt", 4096, NULL, 6, &s_usb_evt_task, 0);
+
+    cdc_acm_host_driver_config_t cfg = {
+        .driver_task_stack_size = 4096,
+        .driver_task_priority   = 5,
+        .xCoreID                = 0,
+        .new_dev_cb             = new_dev_cb,
+    };
+    ESP_ERROR_CHECK(cdc_acm_host_install(&cfg));
+    ESP_LOGI(TAG, "USB und CDC-ACM Host im Hintergrund gestartet");
 
     // System/Netif/Eventloop EINMAL hier
     ESP_ERROR_CHECK(esp_netif_init());
@@ -631,6 +674,7 @@ void app_main(void) {
     xTaskCreatePinnedToCore(usb_keeper_task, "usb_keeper", 4096, NULL, 7, NULL, 0);
     xTaskCreatePinnedToCore(tcp_server_task, "tcp_server_task", 6144, NULL, 6, NULL, 1);
     xTaskCreatePinnedToCore(net_watchdog_task, "net_wd", 3072, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(usb_device_watchdog_task, "usb_dev_wd", 3072, NULL, 5, NULL, 0);
 
     ESP_LOGI(TAG, "Boot OK — ESP32-S3 RTU-over-TCP Bridge läuft");
 }
