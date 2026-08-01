@@ -1,4 +1,4 @@
-// ESP32-S3 RTU-over-TCP Bridge (ESP-IDF 6.0, Managed Components)
+// ESP32-S3 RTU-over-TCP Bridge (ESP-IDF 5.5-3, Managed Components)
 // - USB CDC-ACM Host (Meltem per USB, 19200 8E1) — RX per Callback
 // - TCP-Server (rtuovertcp) für Home Assistant auf Port 5020
 // - WLAN + Hostname, DHCP/Static IP aus app_config.h
@@ -6,10 +6,12 @@
 // - Netz-Watchdog (Reboot falls zu lange ohne IP)
 // - USB-Device-Watchdog (Reboot falls USB-Gerät fehlt)
 // - Akzeptiert TCP-Frames mit/ohne CRC; ergänzt CRC bei Bedarf
+// - Hochperformant: Chunk-Reads, Asynchrone Timer für LED/WLAN, Send-All-Loop
 
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <esp_timer.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -23,6 +25,7 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_pm.h"
+
 
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
@@ -121,6 +124,7 @@ static const char *TAG = "rtu_tcp_bridge";
 
 // ===== LED =====
 static led_strip_handle_t s_strip;
+static esp_timer_handle_t s_led_off_timer;
 
 static inline bool led_is_muted(void) {
 #if APP_LED_KILL_ENABLE
@@ -135,22 +139,35 @@ static inline bool led_is_muted(void) {
 #endif
 
 static inline uint8_t apply_brightness(uint8_t v) {
-    // linear; falls du später Gamma willst, kann man hier eine LUT verwenden
     return (uint8_t)((uint16_t)v * (uint16_t)APP_LED_BRIGHTNESS / 255);
 }
 
 static inline void led_show(uint8_t r, uint8_t g, uint8_t b) {
     if (led_is_muted()) return;
-    led_strip_set_pixel(s_strip, 0,
-        apply_brightness(r), apply_brightness(g), apply_brightness(b));
+    led_strip_set_pixel(s_strip, 0, apply_brightness(r), apply_brightness(g), apply_brightness(b));
     led_strip_refresh(s_strip);
 }
 
-static void led_blink(uint8_t r, uint8_t g, uint8_t b, int on_ms) {
+// Timer-Callback zum asynchronen Ausschalten der LED
+static void led_off_cb(void* arg) {
+    if (!led_is_muted()) {
+        led_strip_clear(s_strip);
+        led_strip_refresh(s_strip);
+    }
+}
+
+// Blockierungsfreies Blinken für den Hot-Path
+static void led_blink_async(uint8_t r, uint8_t g, uint8_t b, int on_ms) {
     if (led_is_muted()) return;
-    led_strip_set_pixel(s_strip, 0,
-        apply_brightness(r), apply_brightness(g), apply_brightness(b));
-    led_strip_refresh(s_strip);
+    led_show(r, g, b);
+    esp_timer_stop(s_led_off_timer);
+    esp_timer_start_once(s_led_off_timer, on_ms * 1000ULL);
+}
+
+// Blockierendes Blinken (nur noch für Watchdog-Reboot genutzt)
+static void led_blink_sync(uint8_t r, uint8_t g, uint8_t b, int on_ms) {
+    if (led_is_muted()) return;
+    led_show(r, g, b);
     vTaskDelay(pdMS_TO_TICKS(on_ms));
     led_strip_clear(s_strip);
     led_strip_refresh(s_strip);
@@ -180,6 +197,10 @@ static void led_init(void) {
     };
     ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &s_strip));
     led_strip_clear(s_strip);
+
+    // Asynchronen LED Timer anlegen
+    esp_timer_create_args_t led_timer_args = { .callback = &led_off_cb, .name = "led_off" };
+    ESP_ERROR_CHECK(esp_timer_create(&led_timer_args, &s_led_off_timer));
 }
 
 // ===== CRC16 (Modbus) =====
@@ -245,7 +266,7 @@ static void data_rx_cb(uint8_t *data, size_t data_len, void *user_arg) {
     if (!s_rx_stream || data_len == 0) return;
     size_t off = 0;
     while (off < data_len) {
-        size_t wrote = xStreamBufferSend(s_rx_stream, data + off, data_len - off, 0);
+        size_t wrote = xStreamBufferSendFromISR(s_rx_stream, data + off, data_len - off, NULL);
         if (wrote == 0) break;
         off += wrote;
     }
@@ -264,7 +285,7 @@ static void new_dev_cb(usb_device_handle_t usb_dev) {
     }
 }
 
-// USB Host + CDC öffnen (Treiber-Installation ist jetzt in app_main)
+// USB Host + CDC öffnen
 static esp_err_t cdc_open_if_needed(void) {
     if (s_cdc) return ESP_OK;
     if (!s_have_vidpid) return ESP_ERR_NOT_FOUND; // Warten, bis Enumeration fertig ist
@@ -316,16 +337,21 @@ static void cdc_close_if_open(void) {
 // ===== WLAN & Netz =====
 static esp_netif_t *s_netif = NULL;
 static volatile bool s_wifi_up = false;
+static esp_timer_handle_t s_wifi_reconnect_timer;
+
+static void wifi_reconnect_cb(void* arg) {
+    ESP_LOGI(TAG, "Starte WLAN Reconnect...");
+    esp_wifi_connect();
+}
 
 static void on_wifi_event(void* arg, esp_event_base_t base, int32_t id, void* data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         s_wifi_up = false;
-        esp_wifi_disconnect();
+        ESP_LOGW(TAG, "WLAN getrennt, starte 3s Backoff-Timer...");
         
-        ESP_LOGW(TAG, "WLAN getrennt, warte 3 Sekunden vor Reconnect...");
-        vTaskDelay(pdMS_TO_TICKS(3000)); // 3 Sekunden Backoff-Zeit
-        
-        esp_wifi_connect();   // reconnect
+        // Timer asynchron starten, um den Event Loop nicht zu blockieren
+        esp_timer_stop(s_wifi_reconnect_timer);
+        esp_timer_start_once(s_wifi_reconnect_timer, 3000000); 
     }
 }
 
@@ -365,6 +391,9 @@ static void net_apply_config(void) {
 }
 
 static void wifi_init_and_connect(void) {
+    esp_timer_create_args_t wifi_timer_args = { .callback = &wifi_reconnect_cb, .name = "wifi_recon" };
+    ESP_ERROR_CHECK(esp_timer_create(&wifi_timer_args, &s_wifi_reconnect_timer));
+
     wifi_init_config_t icfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&icfg));
 
@@ -372,7 +401,7 @@ static void wifi_init_and_connect(void) {
     strncpy((char*)wcfg.sta.ssid, APP_WIFI_SSID, sizeof(wcfg.sta.ssid)-1);
     strncpy((char*)wcfg.sta.password, APP_WIFI_PASS, sizeof(wcfg.sta.password)-1);
     
-    // Wieder auf WPA2, damit der Router es akzeptiert
+    // Bleibt auf WPA2, damit der Router es akzeptiert
     wcfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -387,9 +416,7 @@ static void wifi_init_and_connect(void) {
 }
 
 static void wifi_powersave(void) {
-    // MAX_MODEM ist zu aggressiv, MIN_MODEM hält die Verbindung stabil
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM); 
-    // esp_wifi_set_max_tx_power() entfernt für max power
 }
 
 static void cpu_powersave(void) {
@@ -427,9 +454,13 @@ static ssize_t recv_rtu_frame_with_gap(int sock, uint8_t *buf, size_t maxlen,
     uint32_t last_byte_tick = t_start;
 
     while (got < maxlen) {
-        uint8_t b;
-        int n = recv(sock, &b, 1, 0);
-        if (n == 1) { buf[got++] = b; last_byte_tick = (uint32_t)xTaskGetTickCount(); continue; }
+        // Optimierung: Chunk-Reads statt Syscall pro Byte
+        int n = recv(sock, buf + got, maxlen - got, 0);
+        if (n > 0) { 
+            got += n; 
+            last_byte_tick = (uint32_t)xTaskGetTickCount(); 
+            continue; 
+        }
         if (n == 0) return 0; // peer closed
 
         if (errno == EWOULDBLOCK || errno == EAGAIN || errno == ETIMEDOUT) {
@@ -438,7 +469,9 @@ static ssize_t recv_rtu_frame_with_gap(int sock, uint8_t *buf, size_t maxlen,
             uint32_t since_start = (now - t_start)       * portTICK_PERIOD_MS;
             if (got > 0 && since_byte >= gap_ms) break;
             if (since_start >= overall_ms)  return -2;
-            vTaskDelay(pdMS_TO_TICKS(1));
+            
+            // Kurzes, CPU-schonendes Polling
+            vTaskDelay(pdMS_TO_TICKS(1) > 0 ? pdMS_TO_TICKS(1) : 1);
             continue;
         }
         return -1; // echter Fehler
@@ -446,7 +479,7 @@ static ssize_t recv_rtu_frame_with_gap(int sock, uint8_t *buf, size_t maxlen,
     return (ssize_t)got;
 }
 
-// Blocking-Forward: TX + RX (Callback-Stream, Idle-Gap). TCP-Request darf ohne CRC kommen.
+// Blocking-Forward: TX + RX
 static int forward_rtu_over_cdc(const uint8_t *req, size_t reqlen,
                                 uint8_t *resp, size_t respmax, uint32_t mb_timeout_ms)
 {
@@ -480,7 +513,9 @@ static int forward_rtu_over_cdc(const uint8_t *req, size_t reqlen,
     uint32_t last_rx_tick = t0;
 
     while (got < respmax) {
-        size_t n = xStreamBufferReceive(s_rx_stream, resp + got, respmax - got, pdMS_TO_TICKS(30));
+        // Optimierung: Timeout auf minimales Delay setzen (z.B. 2ms) um Gap korrekt zu prüfen
+        TickType_t rx_timeout = pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1;
+        size_t n = xStreamBufferReceive(s_rx_stream, resp + got, respmax - got, rx_timeout);
         if (n > 0) { got += n; last_rx_tick = (uint32_t)xTaskGetTickCount(); }
         else {
             uint32_t since_rx = ((uint32_t)xTaskGetTickCount() - last_rx_tick) * portTICK_PERIOD_MS;
@@ -521,7 +556,7 @@ static void net_watchdog_task(void* arg) {
 #endif
 }
 
-// USB-Device Watchdog von PR
+// USB-Device Watchdog
 static void usb_device_watchdog_task(void* arg) {
 #if APP_USB_WATCH_DOG_S == 0
     vTaskDelete(NULL);
@@ -533,10 +568,10 @@ static void usb_device_watchdog_task(void* arg) {
         if ((xTaskGetTickCount() - last_ok) > pdMS_TO_TICKS((APP_USB_WATCH_DOG_S)*1000)) {
             ESP_LOGE(TAG, "No USB device for %d s -> reboot", APP_USB_WATCH_DOG_S);
             
-            // NEU: 3 Sekunden lang schnelles, lila Blinken vor dem Neustart
+            // 3 Sekunden lang schnelles, lila Blinken vor dem Neustart
             for (int i = 0; i < 10; i++) {
-                led_blink(255, 0, 255, 150);    // 150ms Lila an, dann aus
-                vTaskDelay(pdMS_TO_TICKS(150)); // 150ms Pause (Aus)
+                led_blink_sync(255, 0, 255, 150);
+                vTaskDelay(pdMS_TO_TICKS(150));
             }
             
             esp_restart();
@@ -558,8 +593,8 @@ static void tcp_server_task(void *arg) {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(TCP_LISTEN_PORT);
 
-    if (bind(listenfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { ESP_LOGE(TAG, "bind()"); close(listenfd); vTaskDelete(NULL); }
-    if (listen(listenfd, 1) < 0)                                     { ESP_LOGE(TAG, "listen()"); close(listenfd); vTaskDelete(NULL); }
+    if (bind(listenfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { ESP_LOGE(TAG, "bind()"); close(listenfd); vTaskDelete(NULL); return; }
+    if (listen(listenfd, 1) < 0)                                     { ESP_LOGE(TAG, "listen()"); close(listenfd); vTaskDelete(NULL); return; }
 
     ESP_LOGI(TAG, "RTU-over-TCP Server lauscht auf *:%d", TCP_LISTEN_PORT);
 
@@ -572,15 +607,14 @@ static void tcp_server_task(void *arg) {
 
         ESP_LOGI(TAG, "Client %s:%d verbunden", inet_ntoa(cli.sin_addr), ntohs(cli.sin_port));
         
-        // Timeout-Timer starten
+        // Optimierung: setsockopt nur einmalig vor der Lese-Schleife setzen
+        struct timeval tvgap; tvgap.tv_sec = 0; tvgap.tv_usec = 2000; // 2 ms Timeout
+        setsockopt(cli_fd, SOL_SOCKET, SO_RCVTIMEO, &tvgap, sizeof(tvgap));
+
         uint32_t last_activity = xTaskGetTickCount(); 
 
         for (;;) {
             if (cdc_open_if_needed() != ESP_OK) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
-
-            // Lücken-Timeout von 20ms wird auf den Socket angewendet
-            struct timeval tvgap; tvgap.tv_sec = 0; tvgap.tv_usec = 20000; 
-            setsockopt(cli_fd, SOL_SOCKET, SO_RCVTIMEO, &tvgap, sizeof(tvgap));
 
             uint8_t req[MB_MAX_FRAME];
             ssize_t rlen = recv_rtu_frame_with_gap(cli_fd, req, sizeof(req), TCP_RX_IDLE_GAP_MS, MB_TIMEOUT_MS);
@@ -588,12 +622,11 @@ static void tcp_server_task(void *arg) {
             if (rlen == 0) { ESP_LOGI(TAG, "Client disconnect"); break; }
             
             if (rlen == -2) {
-                // Manueller Idle-Timeout Check (120 Sekunden)
                 if ((xTaskGetTickCount() - last_activity) > pdMS_TO_TICKS(TCP_CLIENT_TIMEOUT_S * 1000)) {
-                    ESP_LOGW(TAG, "Client idle timeout (%ds) erreicht, werfe ihn raus", TCP_CLIENT_TIMEOUT_S);
+                    ESP_LOGW(TAG, "Client idle timeout (%ds) erreicht", TCP_CLIENT_TIMEOUT_S);
                     break; 
                 }
-                continue; // Nichts empfangen, aber Timeout noch nicht erreicht -> weiterlauschen
+                continue; 
             }
             
             if (rlen < 0) {
@@ -601,16 +634,30 @@ static void tcp_server_task(void *arg) {
                 break;
             }
 
-            // Erfolgreicher Empfang -> Timer zurücksetzen!
             last_activity = xTaskGetTickCount();
 
             uint8_t resp[MB_MAX_FRAME];
             int resp_len = forward_rtu_over_cdc(req, (size_t)rlen, resp, sizeof(resp), MB_TIMEOUT_MS);
-            if (resp_len < 0) { led_blink(255,0,0,50); ESP_LOGE(TAG, "forward_rtu_over_cdc: %d", resp_len); continue; }
+            
+            if (resp_len < 0) { 
+                led_blink_async(255,0,0,50); // Rot
+                ESP_LOGE(TAG, "forward_rtu_over_cdc: %d", resp_len); 
+                continue; 
+            }
 
-            int wn = send(cli_fd, resp, resp_len, 0);
-            if (wn != resp_len) ESP_LOGW(TAG, "send short (%d/%d)", wn, resp_len);
-            else                led_blink(0,255,0,40);   // grün kurz
+            // Optimierung: Robustes send_all
+            int total_sent = 0;
+            while (total_sent < resp_len) {
+                int wn = send(cli_fd, resp + total_sent, resp_len - total_sent, 0);
+                if (wn < 0) break; // Socket Fehler
+                total_sent += wn;
+            }
+
+            if (total_sent != resp_len) {
+                ESP_LOGW(TAG, "send short (%d/%d)", total_sent, resp_len);
+            } else {                
+                led_blink_async(0,255,0,40); // Grün (asynchron)
+            }
         }
 
         close(cli_fd);
@@ -624,10 +671,10 @@ void app_main(void) {
     s_rx_stream  = xStreamBufferCreate(RX_STREAM_CAPACITY, 1);
     configASSERT(s_rx_stream);
 
-	led_init();
-    led_show(0, 0, 255); // Blau = Booten & warten auf Netzwerk
+    led_init();
+    led_show(0, 0, 255); // Blau = Booten & Netzwerk suchen
 
-    // NEU: USB-Treiber so früh wie möglich installieren (mit PR Ergänzungen)
+    // USB-Treiber sofort installieren
     usb_host_config_t host_cfg = {
         .skip_phy_setup = false,
         .intr_flags = ESP_INTR_FLAG_LEVEL1,
@@ -642,9 +689,9 @@ void app_main(void) {
         .new_dev_cb             = new_dev_cb,
     };
     ESP_ERROR_CHECK(cdc_acm_host_install(&cfg));
-    ESP_LOGI(TAG, "USB und CDC-ACM Host im Hintergrund gestartet");
+    ESP_LOGI(TAG, "USB und CDC-ACM Host gestartet");
 
-    // System/Netif/Eventloop EINMAL hier
+    // Netzwerk
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     s_netif = esp_netif_create_default_wifi_sta();
@@ -656,7 +703,7 @@ void app_main(void) {
     wifi_powersave();
     cpu_powersave();
 
-    // --- Boot-Reihenfolge: erst IP abwarten, DANN mDNS/USB/TCP ---
+    // Warten auf IP
     uint32_t t0 = xTaskGetTickCount();
     while (!s_wifi_up && (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(APP_BOOT_IP_WAIT_S*1000)) {
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -666,15 +713,15 @@ void app_main(void) {
         esp_restart();
     }
 
-    start_mdns(); // mDNS erst nach IP
+    start_mdns(); 
 
-    led_show(255,150,0);    // Gelb = Idle (bereit, noch keine Requests)
-    
-    // Jetzt USB/TCP/Watchdog starten
+    led_show(255, 150, 0); // Gelb = Bereit
+
+    // Tasks starten
     xTaskCreatePinnedToCore(usb_keeper_task, "usb_keeper", 4096, NULL, 7, NULL, 0);
     xTaskCreatePinnedToCore(tcp_server_task, "tcp_server_task", 6144, NULL, 6, NULL, 1);
     xTaskCreatePinnedToCore(net_watchdog_task, "net_wd", 3072, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(usb_device_watchdog_task, "usb_dev_wd", 3072, NULL, 5, NULL, 0);
 
-    ESP_LOGI(TAG, "Boot OK — ESP32-S3 RTU-over-TCP Bridge läuft");
+    ESP_LOGI(TAG, "Boot OK — ESP32-S3 RTU-over-TCP Bridge läuft performant");
 }
