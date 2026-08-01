@@ -11,4 +11,5 @@ idf_component_register(
     led_strip
     esp_driver_gpio
     mdns
+    esp_timer
 )
