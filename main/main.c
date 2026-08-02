@@ -11,7 +11,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
-#include <esp_timer.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -25,7 +24,7 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_pm.h"
-
+#include "esp_timer.h"
 
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
@@ -111,7 +110,7 @@
 #define LED_STRIP_LEN  1
 
 #define TCP_LISTEN_PORT       5020
-#define TCP_RX_IDLE_GAP_MS    10
+#define TCP_RX_IDLE_GAP_MS    40
 #define TCP_CLIENT_TIMEOUT_S  120
 
 #define MB_BAUDRATE    19200
@@ -261,15 +260,17 @@ static void dev_event_cb(const cdc_acm_host_dev_event_data_t *event, void *user_
     }
 }
 
+
 // ---- Data-RX Callback → in StreamBuffer ----
-static void data_rx_cb(uint8_t *data, size_t data_len, void *user_arg) {
-    if (!s_rx_stream || data_len == 0) return;
+static bool data_rx_cb(const uint8_t *data, size_t data_len, void *user_arg) {
+    if (!s_rx_stream || data_len == 0) return true;
     size_t off = 0;
     while (off < data_len) {
-        size_t wrote = xStreamBufferSendFromISR(s_rx_stream, data + off, data_len - off, NULL);
+        size_t wrote = xStreamBufferSend(s_rx_stream, data + off, data_len - off, 0);
         if (wrote == 0) break;
         off += wrote;
     }
+    return true;
 }
 
 // ---- New-Device-Callback: VID/PID auslesen ----
@@ -469,10 +470,7 @@ static ssize_t recv_rtu_frame_with_gap(int sock, uint8_t *buf, size_t maxlen,
             uint32_t since_start = (now - t_start)       * portTICK_PERIOD_MS;
             if (got > 0 && since_byte >= gap_ms) break;
             if (since_start >= overall_ms)  return -2;
-            
-            // Kurzes, CPU-schonendes Polling
-            vTaskDelay(pdMS_TO_TICKS(1) > 0 ? pdMS_TO_TICKS(1) : 1);
-            continue;
+            continue; // SO_RCVTIMEO (2ms) übernimmt bereits das Warten/Pollen
         }
         return -1; // echter Fehler
     }
@@ -608,7 +606,7 @@ static void tcp_server_task(void *arg) {
         ESP_LOGI(TAG, "Client %s:%d verbunden", inet_ntoa(cli.sin_addr), ntohs(cli.sin_port));
         
         // Optimierung: setsockopt nur einmalig vor der Lese-Schleife setzen
-        struct timeval tvgap; tvgap.tv_sec = 0; tvgap.tv_usec = 2000; // 2 ms Timeout
+        struct timeval tvgap; tvgap.tv_sec = 0; tvgap.tv_usec = 10000; // 10 ms Timeout
         setsockopt(cli_fd, SOL_SOCKET, SO_RCVTIMEO, &tvgap, sizeof(tvgap));
 
         uint32_t last_activity = xTaskGetTickCount(); 
@@ -649,7 +647,7 @@ static void tcp_server_task(void *arg) {
             int total_sent = 0;
             while (total_sent < resp_len) {
                 int wn = send(cli_fd, resp + total_sent, resp_len - total_sent, 0);
-                if (wn < 0) break; // Socket Fehler
+                if (wn <= 0) break; // Socket Fehler (0 als Sicherheitsnetz gegen Endlosschleife)
                 total_sent += wn;
             }
 
