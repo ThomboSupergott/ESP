@@ -2,7 +2,7 @@
 dependencies:
   ## Required IDF version
   idf:
-    version: '>=4.1.0'
+    version: '>=6.0.0'
   # # Put list of dependencies here
   # # For components maintained by Espressif:
   # component: "~1.0.0"
@@ -15,6 +15,5 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   espressif/led_strip: '*'
-  espressif/usb_host_cdc_acm: ^1
-  espressif/mdns: ^1
-  espressif/usb: '*'
+  espressif/usb_host_cdc_acm: '*'
+  espressif/mdns: '*'
